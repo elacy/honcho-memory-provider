@@ -1760,7 +1760,13 @@ def register(ctx) -> None:
     # request, so it can be flipped without a restart.
     hook = getattr(ctx, "register_middleware", None)
     if callable(hook):
-        hook("llm_request", make_llm_request_middleware(provider))
+        try:
+            hook("llm_request", make_llm_request_middleware(provider))
+        except Exception as exc:  # fail-open invariant: never let register() raise
+            logger.debug(
+                "register_middleware raised (%s); Honcho history slimming is off",
+                exc,
+            )
     else:
         logger.debug(
             "Host exposes no register_middleware; Honcho history slimming is off"

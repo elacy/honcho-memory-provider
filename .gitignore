@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+
+# Honcho / Hermes local state (never commit)
+honcho.json
+.env
+config.yaml
+*.bak
+*.lock
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

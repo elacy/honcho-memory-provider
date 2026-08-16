@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import TRIVIAL_PROMPT_RE, MemoryProvider, is_trivial_prompt
 from .client import spawn_context_thread
+from .context_fix import context_fix_disabled, on_llm_request, sync_join_timeout
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -1456,10 +1457,36 @@ class HonchoMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
 
+        # Guard against overlapping writes. In the blocking mode below this
+        # is a no-op — the previous call already joined its own thread before
+        # returning — so it only does real work when the join is disabled.
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
         self._sync_thread = spawn_context_thread(_sync, name="honcho-sync")
         self._sync_thread.start()
+        join_timeout = self._sync_join_timeout()
+        if join_timeout > 0 and self._sync_thread is not threading.current_thread():
+            # Wait for the write to commit before returning. The memory
+            # manager runs sync_all() before queue_prefetch_all() on one
+            # serialized worker, but both dispatch onto detached threads, so
+            # without this join the next turn's context read routinely lands
+            # before this turn's write — the summary it returns is then one
+            # turn stale. Bounded so a wedged server can't hang the worker.
+            self._sync_thread.join(timeout=join_timeout)
+
+    def _sync_join_timeout(self) -> float:
+        """Seconds sync_turn may block on its own write thread (0 = don't).
+
+        Disabled under ``writeFrequency: "async"``, where save() only enqueues
+        onto the session manager's writer thread: joining the dispatch thread
+        there proves nothing about the write having committed.
+        """
+        if context_fix_disabled():
+            return 0.0
+        write_frequency = getattr(self._config, "write_frequency", "async") if self._config else "async"
+        if write_frequency == "async":
+            return 0.0
+        return sync_join_timeout()
 
     def on_memory_write(
         self,
@@ -1710,3 +1737,8 @@ def register(ctx) -> None:
     ctx.register_memory_provider(
         HonchoMemoryProvider(query_rewriter=rewrite_memory_query)
     )
+    # Honcho observes every turn and injects its own context, so the raw
+    # history Hermes replays on each API call is a second, unbounded copy of
+    # the same conversation. Drop it. Registered unconditionally: the kill
+    # switch is checked per call so it can be flipped without a restart.
+    ctx.register_middleware("llm_request", on_llm_request)

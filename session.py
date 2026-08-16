@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
 from .client import get_honcho_client, spawn_context_thread
+from .context_fix import context_fix_disabled, synthesize_summary
 from .oauth import redact_tokens as _redact_tokens
 
 if TYPE_CHECKING:
@@ -144,6 +145,9 @@ class HonchoSessionManager:
         """
         self._honcho = honcho
         self._context_tokens = context_tokens
+        # Resolved once here rather than per call: the kill switch is an
+        # operator decision for the life of the process.
+        self._context_fix_enabled = not context_fix_disabled()
         self._config = config
         self._runtime_user_peer_name = runtime_user_peer_name
         self._runtime_user_peer_name_alt = runtime_user_peer_name_alt
@@ -983,6 +987,22 @@ class HonchoSessionManager:
         with self._prefetch_cache_lock:
             return self._context_cache.pop(session_key, {})
 
+    def _transcript_labels(self, session: HonchoSession) -> dict[str, str]:
+        """Peer ID → display name for a synthesized session transcript.
+
+        Peer IDs are frequently generated (``user-telegram-<chat>``, a raw
+        numeric gateway user ID) and read as noise in a transcript the model
+        has to interpret, so name the two known peers explicitly. Messages
+        that carry a ``peer_name`` in their metadata use that instead.
+        """
+        user_label = ""
+        if self._config is not None:
+            user_label = str(getattr(self._config, "peer_name", "") or "").strip()
+        return {
+            session.user_peer_id: user_label or "user",
+            session.assistant_peer_id: "assistant",
+        }
+
     def get_prefetch_context(self, session_key: str, user_message: str | None = None) -> dict[str, str]:
         """
         Pre-fetch user and AI peer context from Honcho.
@@ -1014,10 +1034,21 @@ class HonchoSessionManager:
         # Per-directory returning sessions get their accumulated summary.
         try:
             if session.honcho_session_id in self._sessions_cache:
+                # Budget the context server-side: the server builds a summary
+                # that fits instead of us fetching an uncapped blob and
+                # chopping it with _truncate_to_budget. None (contextTokens
+                # unset) is the SDK default and stays uncapped.
+                tokens = self._context_tokens if self._context_fix_enabled else None
                 ctx = self._authed_call(
                     "session summary fetch",
-                    lambda: self._sdk_session(session.honcho_session_id).context(summary=True),
+                    lambda: self._sdk_session(session.honcho_session_id).context(
+                        summary=True, tokens=tokens
+                    ),
                 )
+                if self._context_fix_enabled:
+                    # No server-side summary yet for this session? Use the
+                    # recent messages the same response already carried.
+                    ctx = synthesize_summary(ctx, self._transcript_labels(session))
                 if ctx.summary and getattr(ctx.summary, "content", None):
                     result["summary"] = ctx.summary.content
         except HonchoAuthError:

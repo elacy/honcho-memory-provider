@@ -69,7 +69,7 @@ hermes config set memory.provider honchofork
 ```
 
 Set `contextTokens` in `$HERMES_HOME/honcho.json` if you want the server-side
-budget (fix 1) active — the SDK patch is skipped when unset (uncapped remains
+budget (fix 1) active — no budget is sent when it is unset (uncapped remains
 the explicit opt-out).
 
 See [`docs/configuration.md`](docs/configuration.md) for the full provider

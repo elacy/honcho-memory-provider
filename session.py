@@ -145,9 +145,6 @@ class HonchoSessionManager:
         """
         self._honcho = honcho
         self._context_tokens = context_tokens
-        # Resolved once here rather than per call: the kill switch is an
-        # operator decision for the life of the process.
-        self._context_fix_enabled = not context_fix_disabled()
         self._config = config
         self._runtime_user_peer_name = runtime_user_peer_name
         self._runtime_user_peer_name_alt = runtime_user_peer_name_alt
@@ -1034,20 +1031,32 @@ class HonchoSessionManager:
         # Per-directory returning sessions get their accumulated summary.
         try:
             if session.honcho_session_id in self._sessions_cache:
+                # The kill switch is read here, per call, rather than resolved
+                # once in __init__: an operator flipping
+                # HONCHO_CONTEXT_FIX_DISABLE should take effect without a
+                # restart, and both fixes below are cheap to re-decide.
+                fixes_on = not context_fix_disabled()
                 # Budget the context server-side: the server builds a summary
                 # that fits instead of us fetching an uncapped blob and
-                # chopping it with _truncate_to_budget. None (contextTokens
-                # unset) is the SDK default and stays uncapped.
-                tokens = self._context_tokens if self._context_fix_enabled else None
+                # chopping it with _truncate_to_budget. tokens= is passed only
+                # when contextTokens is actually configured — unset means
+                # "uncapped", which is already the SDK default, so omitting the
+                # kwarg gets the same result without making an unbudgeted
+                # deployment depend on the SDK accepting it.
+                context_kwargs: dict[str, Any] = {"summary": True}
+                if fixes_on and self._context_tokens:
+                    context_kwargs["tokens"] = self._context_tokens
                 ctx = self._authed_call(
                     "session summary fetch",
                     lambda: self._sdk_session(session.honcho_session_id).context(
-                        summary=True, tokens=tokens
+                        **context_kwargs
                     ),
                 )
-                if self._context_fix_enabled:
+                if fixes_on:
                     # No server-side summary yet for this session? Use the
-                    # recent messages the same response already carried.
+                    # recent messages the same response already carried. This
+                    # is independent of the budget above — an unbudgeted
+                    # session needs the synthesized summary just as much.
                     ctx = synthesize_summary(ctx, self._transcript_labels(session))
                 if ctx.summary and getattr(ctx.summary, "content", None):
                     result["summary"] = ctx.summary.content

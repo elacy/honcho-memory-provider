@@ -12,13 +12,16 @@ module holds the parts that are not tied to a single call site:
   has not generated one yet.  Called from
   ``session.HonchoSessionManager.get_prefetch_context``.
 * :func:`on_llm_request` — ``llm_request`` middleware that drops the raw
-  conversation history Hermes replays on every API call.  Registered in
+  conversation history Hermes replays on every API call, and
+  :func:`make_llm_request_middleware`, which binds it to a provider so it only
+  runs in modes where Honcho actually injects context.  Registered in
   ``register()``.
 
 The two remaining fixes live at their call sites because that is all they
 are: ``session.py`` passes ``tokens=`` to ``Session.context`` so the server
 builds the context to fit, and ``__init__.py``'s ``sync_turn`` joins its
-write thread so the write commits before the next turn's read.
+write thread so the write commits before the next turn's read (for the
+write-through ``writeFrequency`` modes — see :func:`sync_join_timeout`).
 
 Everything here is fail-open: on any unexpected shape or error the caller's
 data is returned untouched.  A wrong answer from these fixes must never cost
@@ -30,8 +33,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import types
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,11 @@ def sync_join_timeout() -> float:
     Bounded so a wedged Honcho server can't hang the memory manager's single
     worker forever. ``0`` disables the wait (pure fire-and-forget, the
     behavior before this fix).
+
+    Only consulted for the write-through ``writeFrequency`` modes
+    (``turn``/``session``/N). Under ``async`` the write is handed to the
+    session manager's queue, so there is nothing a join here could wait on;
+    see ``__init__.py``'s ``_sync_join_timeout``.
     """
     raw = os.environ.get(SYNC_JOIN_TIMEOUT_ENV, "").strip()
     if raw:
@@ -228,6 +237,19 @@ def _build_summary(body: str, last_message: Any) -> Any:
 # llm_request middleware: drop replayed history, cap the payload
 # ---------------------------------------------------------------------------
 
+# Hermes fences whatever a memory provider returns from ``prefetch()`` in this
+# tag (``agent/memory_manager.py::build_memory_context_block``) and appends it
+# to the API copy of the current turn's user message
+# (``agent/turn_context.py::compose_api_user_content``). Its presence in the
+# current turn is what tells this middleware that Honcho's context is on the
+# wire and the replayed history is therefore redundant.
+MEMORY_CONTEXT_TAG = "<memory-context>"
+# Matched the way Hermes matches its own fence (``_FENCE_TAG_RE`` in
+# memory_manager.py): case-insensitive and tolerant of whitespace inside the
+# tag, so a future change to how the block is rendered can't silently turn
+# this detector — and with it the whole middleware — into a no-op.
+_MEMORY_CONTEXT_RE = re.compile(r"<\s*memory-context\s*>", re.IGNORECASE)
+
 
 def _estimate_tokens(text: str) -> int:
     if not text:
@@ -274,12 +296,29 @@ def _find_turn_start(messages: list, sys_count: int) -> int:
     so they are NOT boundaries — keep scanning past them until the real
     turn-start user message (the one carrying this turn's Honcho injection).
     Returns -1 when no boundary is found — the caller then passes through.
+
+    Only ``system``/``developer``/``user``/``assistant``/``tool`` are
+    recognized. Anything else means the payload has a shape this middleware
+    was not written against, so it gives up on the whole request rather than
+    guessing a boundary: an unknown role sitting between an assistant tool
+    call and its result would otherwise be taken for the turn start, and the
+    slice would ship the orphaned result without its call (API 400).
     """
     i = len(messages) - 1
     while i >= sys_count:
         msg = messages[i]
         role = msg.get("role") if isinstance(msg, dict) else None
         if role in ("assistant", "tool"):
+            i -= 1
+            continue
+        if role in ("system", "developer"):
+            # A system/developer message *past* the leading block is a
+            # host-injected reminder appended to the tail of the turn in
+            # flight, not a boundary. Skipping it is what keeps a trailing
+            # reminder from being mistaken for the current turn — which would
+            # slice the real user message and its tool loop away. The reminder
+            # itself still ships: everything from the turn start onward is
+            # kept.
             i -= 1
             continue
         if role == "user":
@@ -291,9 +330,54 @@ def _find_turn_start(messages: list, sys_count: int) -> int:
             # scanning backwards for the real turn start.
             i -= 1
             continue
-        # Unknown/unexpected role — be conservative, keep from here.
-        return i
+        # Unknown/unexpected role — this payload isn't the shape we reason
+        # about. Fail open on the whole request.
+        return -1
     return -1
+
+
+def _message_text(msg: dict) -> str:
+    """Flatten a message's content to text (string or multimodal part list).
+
+    Multimodal content is walked too, even though Hermes only ever appends the
+    fence to string content (``compose_api_user_content`` returns None for
+    anything else): a part list that does carry the block should be honored,
+    and one that doesn't reads as "no injection", which is the safe answer.
+    """
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+        return "\n".join(texts)
+    return ""
+
+
+def _turn_carries_injection(messages: list, turn_start: int) -> bool:
+    """True when the current turn carries a Honcho ``<memory-context>`` block.
+
+    This is the load-bearing precondition for stripping: the replayed history
+    may only be dropped when Honcho's injection is there to replace it. It is
+    absent whenever the provider injected nothing this turn — tools-only
+    recall, ``injectionFrequency: first-turn`` past turn 1, a trivial prompt,
+    a cron/flush context, paused auth, an image-only (multimodal) user message
+    that Hermes never fences — and dropping the history in any of those cases
+    would leave the model with no conversation at all.
+
+    Scoped to the current turn on purpose. Earlier turns replay their own
+    fenced blocks (Hermes' ``api_content`` sidecar keeps the prompt-cache
+    prefix byte-stable), so a whole-list search would always match.
+    """
+    for msg in messages[turn_start:]:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            if _MEMORY_CONTEXT_RE.search(_message_text(msg)):
+                return True
+    return False
 
 
 def _slim_messages(request: dict, cap: int) -> Optional[dict]:
@@ -308,6 +392,13 @@ def _slim_messages(request: dict, cap: int) -> Optional[dict]:
     turn_start = _find_turn_start(messages, sys_count)
     if turn_start <= 0:
         return None  # no user message bounds the tail — pass through
+
+    if not _turn_carries_injection(messages, turn_start):
+        logger.debug(
+            "Honcho injected no context into this turn; leaving the replayed "
+            "history in place"
+        )
+        return None
 
     kept = messages[:sys_count] + messages[turn_start:]
     if len(kept) >= len(messages):
@@ -378,3 +469,48 @@ def on_llm_request(*, request: dict, original_request: dict = None, **context: A
     except Exception as e:
         logger.warning("Honcho llm_request middleware error, passing through: %s", e)
         return None
+
+
+def provider_injects_context(provider: Any) -> bool:
+    """True when ``provider`` is in a mode/state where it injects context.
+
+    Second gate in front of :func:`on_llm_request`, checking the provider's
+    own state rather than the payload. It catches the cases the payload check
+    cannot: with auth paused the only thing Honcho injects is the one-time
+    "memory is paused" notice, which is fenced in ``<memory-context>`` like
+    real context but replaces none of the history.
+
+    Duck-typed so this module stays free of provider imports. An object whose
+    state can't be read counts as injecting — the per-request check then has
+    the final say, and both gates fail open.
+    """
+    try:
+        if getattr(provider, "_cron_skipped", False):
+            return False
+        if getattr(provider, "_recall_mode", "hybrid") == "tools":
+            return False
+        if getattr(provider, "_init_auth_failure", None):
+            return False
+        manager = getattr(provider, "_manager", None)
+        if manager is not None and getattr(manager, "_auth_failure", None):
+            return False
+        return True
+    except Exception as e:
+        logger.debug("Honcho middleware gate could not read provider state: %s", e)
+        return True
+
+
+def make_llm_request_middleware(provider: Any) -> Callable[..., Optional[dict]]:
+    """Bind :func:`on_llm_request` to ``provider``'s recall mode and state.
+
+    Registered instead of the bare function because the middleware callback
+    is handed only the request and routing context, with no way back to the
+    provider that decided whether to inject anything this run.
+    """
+
+    def _honcho_llm_request_middleware(**kwargs: Any) -> Optional[dict]:
+        if not provider_injects_context(provider):
+            return None
+        return on_llm_request(**kwargs)
+
+    return _honcho_llm_request_middleware

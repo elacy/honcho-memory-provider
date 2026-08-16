@@ -25,7 +25,11 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import TRIVIAL_PROMPT_RE, MemoryProvider, is_trivial_prompt
 from .client import spawn_context_thread
-from .context_fix import context_fix_disabled, on_llm_request, sync_join_timeout
+from .context_fix import (
+    context_fix_disabled,
+    make_llm_request_middleware,
+    sync_join_timeout,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -1465,7 +1469,7 @@ class HonchoMemoryProvider(MemoryProvider):
         self._sync_thread = spawn_context_thread(_sync, name="honcho-sync")
         self._sync_thread.start()
         join_timeout = self._sync_join_timeout()
-        if join_timeout > 0 and self._sync_thread is not threading.current_thread():
+        if join_timeout > 0:
             # Wait for the write to commit before returning. The memory
             # manager runs sync_all() before queue_prefetch_all() on one
             # serialized worker, but both dispatch onto detached threads, so
@@ -1477,9 +1481,15 @@ class HonchoMemoryProvider(MemoryProvider):
     def _sync_join_timeout(self) -> float:
         """Seconds sync_turn may block on its own write thread (0 = don't).
 
-        Disabled under ``writeFrequency: "async"``, where save() only enqueues
-        onto the session manager's writer thread: joining the dispatch thread
-        there proves nothing about the write having committed.
+        The write-before-read ordering this join buys applies to the
+        write-through modes only: ``writeFrequency`` ``turn``, ``session``,
+        or an integer batch. Under ``async`` — the shipped default — save()
+        hands the batch to the session manager's writer queue and returns, so
+        joining the dispatch thread proves nothing about the write having
+        committed, and blocking until it had would contradict the one thing
+        the operator picked ``async`` for (never stall a turn on a Honcho
+        write). Ordering there stays deferred by design; set
+        ``writeFrequency: "turn"`` in honcho.json to get the guarantee.
         """
         if context_fix_disabled():
             return 0.0
@@ -1734,11 +1744,24 @@ def register(ctx) -> None:
     """Register Honcho as a memory provider plugin."""
     from plugins.memory.query_rewrite import rewrite_memory_query
 
-    ctx.register_memory_provider(
-        HonchoMemoryProvider(query_rewriter=rewrite_memory_query)
-    )
+    provider = HonchoMemoryProvider(query_rewriter=rewrite_memory_query)
+    ctx.register_memory_provider(provider)
+
     # Honcho observes every turn and injects its own context, so the raw
     # history Hermes replays on each API call is a second, unbounded copy of
-    # the same conversation. Drop it. Registered unconditionally: the kill
-    # switch is checked per call so it can be flipped without a restart.
-    ctx.register_middleware("llm_request", on_llm_request)
+    # the same conversation. Drop it — but only when Honcho's context is
+    # actually there to replace it. Several modes inject nothing (tools-only
+    # recall, injectionFrequency: first-turn past turn 1, trivial prompts, a
+    # cron/flush context, paused auth), and stripping the replay on one of
+    # those turns would leave the model with no conversation at all. So the
+    # registered callback is bound to this provider: it gates on the
+    # provider's mode/state, then on_llm_request checks the payload for the
+    # injected <memory-context> block. The kill switch is still read per
+    # request, so it can be flipped without a restart.
+    hook = getattr(ctx, "register_middleware", None)
+    if callable(hook):
+        hook("llm_request", make_llm_request_middleware(provider))
+    else:
+        logger.debug(
+            "Host exposes no register_middleware; Honcho history slimming is off"
+        )
